@@ -31,6 +31,7 @@ export interface Card {
   defaultRate: number; // default rate if no category matches
   minSpend?: number; // minimum spending required for cashback eligibility
   sharedLimitId?: string; // ID to group cards sharing the same limit
+  settlementDays?: number; // Days until transaction is officially settled/posted
 }
 
 export interface UserProfile {

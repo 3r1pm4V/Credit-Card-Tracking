@@ -40,7 +40,8 @@ import {
   isSameDay,
   startOfWeek,
   endOfWeek,
-  getDay
+  getDay,
+  isValid
 } from 'date-fns';
 import { vi } from 'date-fns/locale';
 import { 
@@ -90,6 +91,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'add' | 'history' | 'settings'>('dashboard');
   const [isAddingCard, setIsAddingCard] = useState(false);
   const [editingCard, setEditingCard] = useState<Card | null>(null);
+  const [memberViewMode, setMemberViewMode] = useState<'current' | 'previous'>('current');
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [showDomainWarning, setShowDomainWarning] = useState(false);
 
@@ -425,12 +427,21 @@ export default function App() {
     if (!editingTransaction) return;
     const id = editingTransaction.id;
     const card = cards.find(c => c.id === data.cardId);
-    if (!card) return;
+    if (!card) {
+      return;
+    }
 
     const cashback = calculateCashback(data.amount, data.category, card, data.date, transactions, id, data.type);
     const paymentDueDate = calculatePaymentDueDate(data.date, card);
 
     const updated: Transaction = { ...editingTransaction, ...data, cashback, paymentDueDate };
+    
+    // Sanitize to avoid Firestore 'undefined' errors
+    Object.keys(updated).forEach(key => {
+      if ((updated as any)[key] === undefined) {
+        delete (updated as any)[key];
+      }
+    });
 
     try {
       if (auth.currentUser) {
@@ -474,23 +485,33 @@ export default function App() {
   const calculateCashback = (amount: number, category: Category, targetCard: Card, transDateStr: string, currentTransactions: Transaction[], excludeId?: string, type?: TransactionType) => {
     if (type === 'payment' || type === 'cashback_redemption' || type === 'refund') return 0;
     
+    // Validate target date
+    if (!transDateStr || typeof transDateStr !== 'string') return 0;
+    const transDate = parseISO(transDateStr);
+    if (!isValid(transDate)) return 0;
+
     const rules = targetCard.cashbackRules || [];
     const rule = rules.find(r => r && r.categories && Array.isArray(r.categories) && r.categories.includes(category));
+    
     const rate = rule ? rule.rate : (targetCard.defaultRate || 0);
     let cashback = (amount * rate) / 100;
     
-    if (rule?.cap && rule.categories && Array.isArray(rule.categories)) {
+    if (rule && rule.cap && Array.isArray(rule.categories)) {
       const monthSum = currentTransactions
-        .filter(t => 
-          t.id !== excludeId &&
-          t.cardId === targetCard.id && 
-          rule.categories && Array.isArray(rule.categories) && rule.categories.includes(t.category) && 
-          isWithinInterval(parseISO(t.date), { 
-            start: startOfMonth(parseISO(transDateStr)), 
-            end: endOfMonth(parseISO(transDateStr)) 
-          })
-        )
-        .reduce((acc, t) => acc + (isNaN(t.cashback) ? 0 : t.cashback), 0);
+        .filter(t => {
+          if (!t || t.id === excludeId || t.cardId !== targetCard.id || !rule.categories?.includes(t.category)) {
+            return false;
+          }
+          if (!t.date || typeof t.date !== 'string') return false;
+          const tDate = parseISO(t.date);
+          if (!isValid(tDate)) return false;
+          
+          return isWithinInterval(tDate, { 
+            start: startOfMonth(transDate), 
+            end: endOfMonth(transDate) 
+          });
+        })
+        .reduce((acc, t) => acc + (t && !isNaN(t.cashback) ? t.cashback : 0), 0);
       
       const remaining = Math.max(0, rule.cap - monthSum);
       cashback = Math.min(cashback, remaining);
@@ -516,11 +537,22 @@ export default function App() {
       return isWithinInterval(date, { start: startOfMonth(now), end: endOfMonth(now) });
     });
 
-    const spendingTransactions = currentMonthTransactions.filter(t => !t.type || t.type === 'standard' || t.type === 'installment');
-    const totalSpent = spendingTransactions.reduce((acc, t) => acc + (isNaN(t.amount) ? 0 : t.amount), 0);
-    const totalCashback = spendingTransactions.reduce((acc, t) => acc + (isNaN(t.cashback) ? 0 : t.cashback), 0);
+    // Global totals regardless of month
+    const totalSpent = transactions.reduce((acc, t) => {
+      if (!t.type || t.type === 'standard' || t.type === 'installment') {
+        return acc + (isNaN(t.amount) ? 0 : t.amount);
+      }
+      return acc;
+    }, 0);
+    const totalCashback = transactions.reduce((acc, t) => {
+      if (!t.type || t.type === 'standard' || t.type === 'installment') {
+        return acc + (isNaN(t.cashback) ? 0 : t.cashback);
+      }
+      return acc;
+    }, 0);                
     
     // Group transactions by category for chart
+    const spendingTransactions = transactions.filter(t => !t.type || t.type === 'standard' || t.type === 'installment');
     const categoryData = CATEGORIES.map(cat => ({
       name: cat.label,
       value: spendingTransactions
@@ -544,19 +576,25 @@ export default function App() {
 
       const statementDate = getSafeDate(cycleStart.getFullYear(), cycleStart.getMonth() + 1, card.statementDay);
       const paymentDueDate = addDays(statementDate, card.gracePeriod);
+      const settlementDays = card.settlementDays || 0;
 
-      const currentCycleTransactions = transactions.filter(t => {
-        const tDate = parseISO(t.date);
-        return t.cardId === card.id && (isAfter(tDate, cycleStart) || format(tDate, 'yyyy-MM-dd') === format(cycleStart, 'yyyy-MM-dd'));
-      });
-
-      const balance = currentCycleTransactions.reduce((acc, t) => {
-        const amt = isNaN(t.amount) ? 0 : t.amount;
-        if (t.type === 'payment' || t.type === 'cashback_redemption' || t.type === 'refund') return acc - amt;
-        return acc + amt;
-      }, 0);
-      const cashback = currentCycleTransactions
-        .filter(t => !t.type || t.type === 'standard' || t.type === 'installment')
+      const balance = transactions
+        .filter(t => t.cardId === card.id)
+        .reduce((acc, t) => {
+          const amt = isNaN(t.amount) ? 0 : t.amount;
+          
+          // Transaction belongs to statement period based on settled date
+          const settledDate = addDays(parseISO(t.date), settlementDays);
+          
+          // Only include if settled date is within the current statement cycle [cycleStart, statementDate]
+          if (isAfter(settledDate, statementDate)) return acc;
+          
+          if (t.type === 'payment' || t.type === 'cashback_redemption' || t.type === 'refund') return acc - amt;
+          return acc + amt;
+        }, 0);
+        
+      const cashback = transactions
+        .filter(t => t.cardId === card.id && (!t.type || t.type === 'standard' || t.type === 'installment'))
         .reduce((acc, t) => acc + (isNaN(t.cashback) ? 0 : t.cashback), 0);
 
       return { 
@@ -594,49 +632,53 @@ export default function App() {
     // Member-based breakdown for shared cards
     const userMembers = currentProfile?.members || ['Tôi'];
     const memberBreakdown = userMembers.map(name => {
-      // Find all transactions by this member for the current statement cycles across all cards
-      const memberCycleTransactions = transactions.filter(t => {
-        const tMember = t.memberName || 'Tôi';
-        if (tMember !== name) return false;
+      // Helper function to get debt for a specific cycle
+      const getDebtForCycle = (offset: number) => {
+        const memberDebtTransactions = transactions.filter(t => {
+          const tMember = t.memberName || 'Tôi';
+          if (tMember !== name) return false;
+          
+          const card = cards.find(c => c.id === t.cardId);
+          if (!card) return false;
+
+          const getSafeDate = (year: number, month: number, targetDay: number) => {
+            const d = new Date(year, month, 1);
+            const last = lastDayOfMonth(d).getDate();
+            return new Date(year, month, Math.min(targetDay, last));
+          };
+
+          // Determine current cycle and previous cycle start based on offset
+          let cycleStart = getSafeDate(now.getFullYear(), now.getMonth() + offset, card.statementDay);
+          if (cycleStart > now) {
+            cycleStart = getSafeDate(now.getFullYear(), now.getMonth() + offset - 1, card.statementDay);
+          }
+          const endOfCycle = getSafeDate(cycleStart.getFullYear(), cycleStart.getMonth() + 1, card.statementDay);
+
+          const tDate = parseISO(t.date);
+          return isAfter(tDate, cycleStart) && !isAfter(tDate, endOfCycle);
+        });
+
+        const debt = memberDebtTransactions.reduce((acc, t) => {
+          const amt = isNaN(t.amount) ? 0 : t.amount;
+          if (t.type === 'payment' || t.type === 'cashback_redemption' || t.type === 'refund') return acc - amt;
+          return acc + amt;
+        }, 0);
+
+        const totalSpent = memberDebtTransactions
+          .filter(t => !t.type || t.type === 'standard' || t.type === 'installment')
+          .reduce((acc, t) => acc + (isNaN(t.amount) ? 0 : t.amount), 0);
         
-        // Find which card this t belongs to and its specific cycle
-        const card = cards.find(c => c.id === t.cardId);
-        if (!card) return false;
+        const totalCashback = memberDebtTransactions
+          .filter(t => !t.type || t.type === 'standard' || t.type === 'installment')
+          .reduce((acc, t) => acc + (isNaN(t.cashback) ? 0 : t.cashback), 0);
 
-        const getSafeDate = (year: number, month: number, targetDay: number) => {
-          const d = new Date(year, month, 1);
-          const last = lastDayOfMonth(d).getDate();
-          return new Date(year, month, Math.min(targetDay, last));
-        };
-
-        let cycleStart = getSafeDate(now.getFullYear(), now.getMonth(), card.statementDay);
-        if (cycleStart > now) {
-          cycleStart = getSafeDate(now.getFullYear(), now.getMonth() - 1, card.statementDay);
-        }
-        
-        const tDate = parseISO(t.date);
-        return isAfter(tDate, cycleStart) || format(tDate, 'yyyy-MM-dd') === format(cycleStart, 'yyyy-MM-dd');
-      });
-
-      const debt = memberCycleTransactions.reduce((acc, t) => {
-        const amt = isNaN(t.amount) ? 0 : t.amount;
-        if (t.type === 'payment' || t.type === 'cashback_redemption' || t.type === 'refund') return acc - amt;
-        return acc + amt;
-      }, 0);
-
-      const totalSpent = memberCycleTransactions
-        .filter(t => !t.type || t.type === 'standard' || t.type === 'installment')
-        .reduce((acc, t) => acc + (isNaN(t.amount) ? 0 : t.amount), 0);
-
-      const totalCashback = memberCycleTransactions
-        .filter(t => !t.type || t.type === 'standard' || t.type === 'installment')
-        .reduce((acc, t) => acc + (isNaN(t.cashback) ? 0 : t.cashback), 0);
+        return { debt, totalSpent, totalCashback };
+      };
 
       return {
         name,
-        debt,
-        totalSpent,
-        totalCashback
+        current: getDebtForCycle(0), // Current cycle
+        previous: getDebtForCycle(-1) // Previous cycle
       };
     });
 
@@ -905,13 +947,22 @@ export default function App() {
 
                   <div className="mt-4">
                     <CardSection title="Dư nợ theo thành viên" icon={<Wallet size={18} />}>
+                      <div className="flex items-center justify-between mb-4">
+                        <button onClick={() => setMemberViewMode('previous')} className="text-slate-500 hover:text-white"><ChevronLeft size={16}/></button>
+                        <p className="text-xs font-bold uppercase text-slate-400">
+                          {memberViewMode === 'current' ? 'Kỳ hiện tại' : 'Kỳ trước'}
+                        </p>
+                        <button onClick={() => setMemberViewMode('current')} className="text-slate-500 hover:text-white"><ChevronLeft size={16} className="rotate-180"/></button>
+                      </div>
                       <div className="space-y-4">
-                        {metrics.memberBreakdown.map((member) => (
+                        {metrics.memberBreakdown.map((member) => {
+                          const data = member[memberViewMode];
+                          return (
                           <div key={member.name} className="flex items-center justify-between p-4 bg-slate-900 border border-slate-700/50 rounded-2xl">
                             <div className="flex items-center gap-3">
                               <div className={cn(
                                 "size-10 rounded-xl flex items-center justify-center font-black text-sm",
-                                member.debt > 0 ? "bg-orange-500/10 text-orange-500" : "bg-emerald-500/10 text-emerald-500"
+                                data.debt > 0 ? "bg-orange-500/10 text-orange-500" : "bg-emerald-500/10 text-emerald-500"
                               )}>
                                 {member.name.charAt(0).toUpperCase()}
                               </div>
@@ -921,22 +972,22 @@ export default function App() {
                               </div>
                             </div>
                             <div className="text-right">
-                              <p className={cn("text-lg font-black tabular-nums leading-none mb-1", member.debt > 0 ? "text-orange-500" : "text-emerald-500")}>
-                                {formatCurrency(member.debt)}
+                              <p className={cn("text-lg font-black tabular-nums leading-none mb-1", data.debt > 0 ? "text-orange-500" : "text-emerald-500")}>
+                                {formatCurrency(data.debt)}
                               </p>
                               <p className="text-[10px] text-slate-500 font-bold uppercase">
-                                Hoàn {formatCurrency(member.totalCashback)}
+                                Hoàn {formatCurrency(data.totalCashback)}
                               </p>
                             </div>
                           </div>
-                        ))}
+                        )})}
                       </div>
                     </CardSection>
                   </div>
                 </div>
               </div>
 
-              <div className="col-span-12 lg:col-span-5 grid gap-4">
+              <div className="col-span-12 lg:col-span-12 grid grid-cols-1 lg:grid-cols-2 gap-4">
                 <CardSection title="Tiền đã chi tiêu" icon={<CreditCard size={18} />}>
                   <div className="space-y-3">
                     {metrics.cardBalances.map((card) => (
@@ -1006,29 +1057,27 @@ export default function App() {
                   </div>
                 </CardSection>
 
-                <CardSection title="Tối ưu thẻ" icon={<TrendingUp size={18} />}>
-                   <div className="text-xs space-y-3">
-                      <p className="text-slate-400">Gợi ý tối ưu dựa trên danh mục thẻ hiện có của bạn:</p>
-                      {metrics.optimizationSuggestions.length > 0 ? (
-                        metrics.optimizationSuggestions.map((sug, idx) => (
-                          <div key={idx} className={cn(
-                            "p-3 border rounded-xl transition-all",
-                            idx === 0 ? "bg-emerald-500/10 border-emerald-500/20" : "bg-slate-900 border-slate-700/50"
-                          )}>
-                            <p className={cn("font-medium", idx === 0 ? "text-emerald-400" : "text-slate-300")}>
-                              Mẹo {catEmoji(sug?.categoryLabel)}: Khi chi tiêu <span className="font-bold">{sug?.categoryLabel}</span>, bạn nên ưu tiên <span className={cn("font-black", idx === 0 ? "text-emerald-300" : "text-white")}>{sug?.cardName}</span> để nhận mức hoàn <span className="underline decoration-2 underline-offset-2">{sug?.rate}%</span>.
-                            </p>
-                          </div>
-                        ))
-                      ) : (
-                        <p className="text-[10px] text-slate-600 italic">Vui lòng thêm thẻ để nhận gợi ý tối ưu.</p>
-                      )}
-                   </div>
-                </CardSection>
-              </div>
+                <div className="space-y-4">
+                  <CardSection title="Tối ưu thẻ" icon={<TrendingUp size={18} />}>
+                     <div className="text-xs space-y-3">
+                        <p className="text-slate-400">Gợi ý tối ưu dựa trên danh mục thẻ hiện có của bạn:</p>
+                        {metrics.optimizationSuggestions.length > 0 ? (
+                          metrics.optimizationSuggestions.map((sug, idx) => (
+                            <div key={idx} className={cn(
+                              "p-3 border rounded-xl transition-all",
+                              idx === 0 ? "bg-emerald-500/10 border-emerald-500/20" : "bg-slate-900 border-slate-700/50"
+                            )}>
+                              <p className={cn("font-medium", idx === 0 ? "text-emerald-400" : "text-slate-300")}>
+                                Mẹo {catEmoji(sug?.categoryLabel)}: Khi chi tiêu <span className="font-bold">{sug?.categoryLabel}</span>, bạn nên ưu tiên <span className={cn("font-black", idx === 0 ? "text-emerald-300" : "text-white")}>{sug?.cardName}</span> để nhận mức hoàn <span className="underline decoration-2 underline-offset-2">{sug?.rate}%</span>.
+                              </p>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="text-[10px] text-slate-600 italic">Vui lòng thêm thẻ để nhận gợi ý tối ưu.</p>
+                        )}
+                     </div>
+                  </CardSection>
 
-              <div className="col-span-12 lg:col-span-7 grid gap-4">
-                <div className="grid grid-cols-2 gap-4">
                   <CardSection title="Phân bổ" icon={<PieChartIcon size={18} />}>
                     <div className="h-[180px]">
                       <ResponsiveContainer width="100%" height="100%">
@@ -1057,49 +1106,6 @@ export default function App() {
                     </div>
                   </CardSection>
                 </div>
-
-                <div className="grid grid-cols-1 gap-4">
-                  <CardSection title="Nhắc nợ" icon={<AlertCircle size={18} />}>
-                     <div className="space-y-2 h-[180px] overflow-y-auto no-scrollbar">
-                        {metrics.upcomingDues.slice(0, 3).map(due => (
-                          <div key={due.id} className="p-2.5 bg-slate-900 border-l-4 border-orange-500 rounded-lg">
-                            <p className="text-[10px] font-bold text-slate-500 truncate">{cards.find(c => c.id === due.cardId)?.name}</p>
-                            <p className="font-bold text-sm tracking-tight">{formatCurrency(due.balance)}</p>
-                          </div>
-                        ))}
-                        {metrics.upcomingDues.length === 0 && <p className="text-[10px] text-slate-500 text-center pt-8 italic">Không có nợ.</p>}
-                     </div>
-                  </CardSection>
-                </div>
-
-                <CardSection title="Giao dịch gần đây" icon={<History size={18} />}>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left text-xs">
-                      <thead>
-                        <tr className="text-slate-500 font-bold uppercase tracking-widest border-b border-slate-700">
-                          <th className="pb-2">Thẻ</th>
-                          <th className="pb-2 text-right">Số tiền</th>
-                          <th className="pb-2 text-right text-emerald-500">Hoàn</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-700/50">
-                        {transactions.slice(0, 5).map(t => (
-                          <tr key={t.id} className="hover:bg-slate-700/20 transition-colors">
-                            <td className="py-2.5">
-                              <div className="flex items-center gap-1.5 leading-none mb-1">
-                                <p className="font-bold">{t.description || 'GD'}</p>
-                                {t.type === 'installment' && <span className="text-[7px] font-black bg-orange-500/10 text-orange-500 px-1 rounded border border-orange-500/20 uppercase">Trả góp</span>}
-                              </div>
-                              <p className="text-[10px] text-slate-500">{cards.find(c => c.id === t.cardId)?.bank}</p>
-                            </td>
-                            <td className="py-2.5 text-right font-bold">{formatCurrency(isNaN(t.amount) ? 0 : t.amount)}</td>
-                            <td className="py-2.5 text-right text-emerald-500 font-bold">+{formatCurrency(isNaN(t.cashback) ? 0 : t.cashback)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </CardSection>
               </div>
             </motion.div>
           )}
@@ -1165,15 +1171,6 @@ export default function App() {
                 </h3>
                 {selectedDate && (
                   <div className="flex gap-2">
-                    <button 
-                      onClick={() => {
-                        setEditingTransaction({ date: selectedDate.toISOString() });
-                        setActiveTab('add');
-                      }}
-                      className="px-3 py-1 bg-blue-500/10 hover:bg-blue-500 text-blue-400 hover:text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-all border border-blue-500/20 flex items-center gap-1.5"
-                    >
-                      <Plus size={12} /> Thêm GD
-                    </button>
                     <button 
                       onClick={() => setSelectedDate(null)}
                       className="text-[10px] font-black uppercase text-blue-400 hover:text-blue-300 transition-colors"
@@ -1410,6 +1407,7 @@ function CardForm({ onSubmit, initialData }: { onSubmit: (card: Card) => void; i
   const [cashbackRules, setCashbackRules] = useState<CashbackRule[]>(initialData?.cashbackRules || []);
   const [defaultRate, setDefaultRate] = useState(initialData?.defaultRate || 0);
   const [sharedLimitId, setSharedLimitId] = useState(initialData?.sharedLimitId || '');
+  const [settlementDays, setSettlementDays] = useState(initialData?.settlementDays || 0);
   const [isSearching, setIsSearching] = useState(false);
 
   const searchCardDetails = async () => {
@@ -1468,6 +1466,7 @@ function CardForm({ onSubmit, initialData }: { onSubmit: (card: Card) => void; i
       defaultRate,
       minSpend,
       sharedLimitId: sharedLimitId || undefined,
+      settlementDays: settlementDays || undefined,
     };
     onSubmit(newCard);
   };
@@ -1552,6 +1551,17 @@ function CardForm({ onSubmit, initialData }: { onSubmit: (card: Card) => void; i
               value={isNaN(minSpend) ? '' : minSpend} 
               onChange={e => setMinSpend(parseInt(e.target.value) || 0)} 
             />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-bold uppercase text-slate-500 ml-1">Số ngày bút toán (settlement days)</label>
+            <input 
+              type="number" 
+              placeholder="0" 
+              className="bento-input h-12" 
+              value={isNaN(settlementDays) ? '' : settlementDays} 
+              onChange={e => setSettlementDays(parseInt(e.target.value) || 0)} 
+            />
+            <p className="text-[8px] text-slate-500 italic mt-1 px-1">Khoảng cách ngày giao dịch lên sao kê.</p>
           </div>
         </div>
 
@@ -1739,9 +1749,16 @@ function TransactionForm({
     if (formData.type === 'payment' || formData.type === 'cashback_redemption' || formData.type === 'refund') return 0;
     const amt = parseFloat(formData.amount) || 0;
     const rules = selectedCard?.cashbackRules || [];
-    const rule = rules.find(r => r && r.categories && Array.isArray(r.categories) && r.categories.includes(formData.category));
-    const rate = rule ? rule.rate : (selectedCard?.defaultRate || 0);
-    const result = (amt * (isNaN(rate) ? 0 : rate)) / 100;
+    
+    // Find matching rule with extreme defensive checks
+    const rule = rules.find(r => 
+      r && 
+      Array.isArray(r.categories) && 
+      r.categories.includes(String(formData.category) as any)
+    );
+    
+    const rate = rule && typeof rule.rate === 'number' ? rule.rate : (selectedCard?.defaultRate || 0);
+    const result = (amt * rate) / 100;
     return isNaN(result) ? 0 : result;
   }, [formData, selectedCard]);
 
