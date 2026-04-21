@@ -1,0 +1,6 @@
+{
+  "name": "Credit Card Cashback & Billing Tracker",
+  "description": "Quản lý chi tiêu thẻ tín dụng, tính toán tiền hoàn (cashback) và theo dõi ngày thanh toán theo từng loại thẻ (Woori, HSBC, VIB, Sacombank, Kbank, etc.)",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

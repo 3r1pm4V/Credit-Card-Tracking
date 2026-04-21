@@ -1,0 +1,72 @@
+{
+  "entities": {
+    "Card": {
+      "title": "Credit Card",
+      "description": "Details of a user's credit card and its cashback rules",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "bank": { "type": "string" },
+        "statementDay": { "type": "integer" },
+        "gracePeriod": { "type": "integer" },
+        "defaultRate": { "type": "number" },
+        "cashbackRules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "categories": { "type": "array", "items": { "type": "string" } },
+              "rate": { "type": "number" },
+              "cap": { "type": "number" }
+            }
+          }
+        }
+      },
+      "required": ["id", "name", "bank", "statementDay", "gracePeriod", "cashbackRules", "defaultRate"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "A financial transaction made by the user on a specific card",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "cardId": { "type": "string" },
+        "amount": { "type": "number" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "cashback": { "type": "number" },
+        "paymentDueDate": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "cardId", "amount", "category", "description", "date", "cashback", "paymentDueDate"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "General information about the user",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Collection of user profiles"
+    },
+    "/users/{userId}/cards/{cardId}": {
+      "schema": "Card",
+      "description": "Subcollection of cards belonging to a specific user"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Subcollection of transactions belonging to a specific user"
+    }
+  }
+}

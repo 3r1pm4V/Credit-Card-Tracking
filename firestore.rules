@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 1. User Profiles
+    match /users/{userId} {
+      allow get, create, update: if request.auth != null && request.auth.uid == userId;
+      allow get: if resource != null && resource.data.get('shareEnabled', false) == true;
+    }
+
+    // 2. Cards (Nested path explicitly defined)
+    match /users/{userId}/cards/{cardId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if get(/databases/$(database)/documents/users/$(userId)).data.get('shareEnabled', false) == true;
+    }
+
+    // 3. Transactions (Nested path explicitly defined)
+    match /users/{userId}/transactions/{transactionId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read: if get(/databases/$(database)/documents/users/$(userId)).data.get('shareEnabled', false) == true;
+    }
+
+    // 2. Share Mappings (Short URLs)
+    match /share_mappings/{shareId} {
+      allow get: if true;
+      allow create, delete: if request.auth != null;
+    }
+  }
+}
