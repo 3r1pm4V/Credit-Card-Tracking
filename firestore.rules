@@ -6,6 +6,11 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Connectivity Test
+    match /test/connection {
+      allow get: if true;
+    }
+
     // 1. User Profiles
     match /users/{userId} {
       allow get, create, update: if request.auth != null && request.auth.uid == userId;
